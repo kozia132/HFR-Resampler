@@ -3,6 +3,7 @@ import time
 import subprocess
 import os
 import ntpath
+import sys
 
 import cv2 as cv
 
@@ -52,6 +53,63 @@ def parseResolution(in_res, out_res):
     else:
         return new_res
 
+def buildEncoderCommand(encoder_settings, output_res, output_fps, output_name):
+    """Build FFmpeg command based on encoder settings"""
+    encoder = encoder_settings.get("encoder", "libx264")
+    preset = encoder_settings.get("preset", "medium")
+    crf = encoder_settings.get("crf", 18)
+    pixel_format = encoder_settings.get("pixel_format", "yuv420p")
+    extra_params = encoder_settings.get("extra_params", [])
+    
+    cmd = [
+        'ffmpeg',
+        '-y',  # Overwrite output
+        '-f', 'rawvideo',
+        '-vcodec', 'rawvideo',
+        '-s', f'{output_res[0]}x{output_res[1]}',
+        '-pix_fmt', 'bgr24',
+        '-r', str(output_fps),
+        '-i', '-',  # Input from pipe
+        '-c:v', encoder,
+    ]
+    
+    # Add preset if supported by encoder
+    if encoder in ['libx264', 'libx265', 'h264_nvenc', 'hevc_nvenc', 'h264_qsv', 'hevc_qsv']:
+        cmd.extend(['-preset', preset])
+    
+    # Add CRF/quality settings based on encoder
+    if encoder in ['libx264', 'libx265']:
+        cmd.extend(['-crf', str(crf)])
+    elif encoder in ['h264_nvenc', 'hevc_nvenc']:
+        cmd.extend(['-cq', str(crf)])  # NVENC uses -cq instead of -crf
+    elif encoder in ['h264_qsv', 'hevc_qsv']:
+        cmd.extend(['-global_quality', str(crf)])  # QSV uses global_quality
+    elif encoder == 'h264_amf':
+        cmd.extend(['-quality', 'quality', '-qp_i', str(crf)])
+    
+    # Add pixel format
+    cmd.extend(['-pix_fmt', pixel_format])
+    
+    # Add any extra parameters
+    cmd.extend(extra_params)
+    
+    cmd.append(f'no-audio_{output_name}')
+    
+    return cmd
+
+def testEncoder(encoder):
+    """Test if an encoder is available"""
+    try:
+        result = subprocess.run(
+            ['ffmpeg', '-hide_banner', '-encoders'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        return encoder in result.stdout
+    except:
+        return False
+
 def processVideo(settings):
     input_name = settings["input_name"]
 
@@ -87,15 +145,50 @@ def processVideo(settings):
     fps_ratio = int(fps_ratio)
     input_nframes = input_video.get(cv.CAP_PROP_FRAME_COUNT)
     output_nframes = int(input_nframes/fps_ratio)
-    fourcc_code = settings["fourcc"]
 
     print(f"Input Res : {input_res}\nOutput Res : {output_res}")
 
     blended_nframes = int(blend_range*fps_ratio)
     weights = weight(blend_mode, blended_nframes)
 
-    output_video = cv.VideoWriter(filename=f"no-audio_{output_name}", fourcc=cv.VideoWriter_fourcc(*fourcc_code),
-                                  fps=int(output_fps), frameSize=(output_res[0], output_res[1]))
+    # Check if we should use FFmpeg encoder or OpenCV
+    use_ffmpeg_encoder = settings.get("use_ffmpeg_encoder", False)
+    encoder_settings = settings.get("encoder_settings", {})
+    
+    if use_ffmpeg_encoder:
+        # Test if encoder is available
+        encoder = encoder_settings.get("encoder", "libx264")
+        print(f"Using FFmpeg encoder: {encoder}")
+        
+        if not testEncoder(encoder):
+            print(f"WARNING: Encoder '{encoder}' not available, falling back to libx264")
+            encoder_settings["encoder"] = "libx264"
+        
+        # Build FFmpeg command
+        ffmpeg_cmd = buildEncoderCommand(encoder_settings, output_res, output_fps, output_name)
+        
+        # Start FFmpeg process
+        try:
+            ffmpeg_process = subprocess.Popen(
+                ffmpeg_cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+        except Exception as e:
+            raise Exception(f"Failed to start FFmpeg encoder: {e}")
+        
+        output_writer = ffmpeg_process
+    else:
+        # Use OpenCV VideoWriter (old method)
+        fourcc_code = settings["fourcc"]
+        print(f"Using OpenCV VideoWriter with fourcc: {fourcc_code}")
+        output_writer = cv.VideoWriter(
+            filename=f"no-audio_{output_name}",
+            fourcc=cv.VideoWriter_fourcc(*fourcc_code),
+            fps=int(output_fps),
+            frameSize=(output_res[0], output_res[1])
+        )
 
     needResize = False
     if input_res != output_res:
@@ -113,7 +206,13 @@ def processVideo(settings):
             frame = cv.resize(frame, (output_res[0], output_res[1]))
         imgs.append(frame)
 
-    output_video.write(blend(np.asarray(imgs), weights))
+    blended_frame = blend(np.asarray(imgs), weights)
+    
+    if use_ffmpeg_encoder:
+        ffmpeg_process.stdin.write(blended_frame.tobytes())
+    else:
+        output_writer.write(blended_frame)
+    
     del imgs[:fps_ratio]
 
     # Next iteration, load remaining unloaded frames
@@ -125,7 +224,19 @@ def processVideo(settings):
                 frame = cv.resize(frame, (output_res[0], output_res[1]))
             imgs.append(frame)
 
-        output_video.write(blend(np.asarray(imgs), weights))
+        blended_frame = blend(np.asarray(imgs), weights)
+        
+        if use_ffmpeg_encoder:
+            try:
+                ffmpeg_process.stdin.write(blended_frame.tobytes())
+            except BrokenPipeError:
+                print("ERROR: FFmpeg encoder crashed")
+                stderr = ffmpeg_process.stderr.read().decode()
+                print(f"FFmpeg error: {stderr}")
+                sys.exit(1)
+        else:
+            output_writer.write(blended_frame)
+        
         del imgs[:fps_ratio]
 
         elapsed_time = (time.process_time()-timer_start)
@@ -139,8 +250,20 @@ def processVideo(settings):
               time.gmtime(math.ceil(avg_time*int(output_nframes-i)))))
         print(f"Progress     : {i}/{output_nframes} - ",
               '%.3f' % (100*i/output_nframes), "%")
-            
-    output_video.release()
+    
+    # Clean up
+    if use_ffmpeg_encoder:
+        ffmpeg_process.stdin.close()
+        ffmpeg_process.wait()
+        
+        # Check for errors
+        if ffmpeg_process.returncode != 0:
+            stderr = ffmpeg_process.stderr.read().decode()
+            print(f"FFmpeg encoding failed: {stderr}")
+            sys.exit(1)
+    else:
+        output_writer.release()
+    
     input_video.release()
     addAudio(input_name, output_name)
 
