@@ -5,6 +5,16 @@
     "cv_colourfix": false,
     "blend_range": 1.0, 
     "blend_mode": "EQUAL",
+    "use_ffmpeg_encoder": true,
+    "encoder_settings": {
+        "encoder": "h264_nvenc",
+        "preset": "fast",
+        "crf": 18,
+        "pixel_format": "yuv420p",
+        "extra_params": []
+    },
+    "output_suffix": "_60fps",
+    "output_extension": ".mkv",
     "blend_settings": {
         "pyramid": {
             "reverse": false
